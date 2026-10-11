@@ -65,6 +65,21 @@ const NOTES = { command: "uvx", args: ["notes-mcp==1.0.0"] };
 const CURSOR_USER = '{\n  "theme": "dark",\n  "mcpServers": {\n    "notes": { "command": "uvx", "args": ["notes-mcp==1.0.0"] }\n  }\n}\n';
 const CODEX_USER = '# my codex settings\nmodel = "o4"\n\n[mcp_servers.notes]\ncommand = "uvx"\nargs = ["notes-mcp==1.0.0"]\n';
 const PROJECT_MCP = JSON.stringify({ mcpServers: { notes: NOTES } }, null, 2) + "\n";
+// 정확한 버전 Update(v0.2.0 RC): 실제 npm의 memory-mcp 두 버전. 번들 Registry(수정 없음)의 고정 안 된 Manifest에서 시작한다.
+const MEMORY_PKG = "@modelcontextprotocol/server-memory";
+const MEMORY_V1 = "2026.7.4";
+const MEMORY_V2 = "2026.8.31";
+// Health 실패 보상(격리 환경의 합성 실패): 앱을 npm_config_node_options=--require=<이 파일>로 다시 띄운다. npm(npx)은 이 설정을
+// 자기가 실행하는 명령(npx -y <spec>이면 MCP 서버)의 NODE_OPTIONS로 넘긴다(npm 자신과 Electron에는 적용되지 않는다. 패키징된
+// Electron은 NODE_OPTIONS 대부분을 허용하지 않아 그 경로는 쓸 수 없다). Health는 앱 환경을 상속한다. npx Prepare도 npm_config_*를
+// 받지만 실행 명령이 "node --version"이라 이 파일이 아무것도 하지 않는다. 이 파일은 memory 서버 프로세스만 즉시 끝내고 표시를 남긴다.
+const HEALTH_FAIL_INJECTOR = String.raw`const argv = process.argv.slice(1).join(" ");
+if (argv.includes("server-memory") && !argv.includes("--package=") && !argv.includes("config get")) {
+  try { require("node:fs").appendFileSync(process.env.OPENHUB_RC_INJECT_MARK, "health-launch-killed\n"); } catch {}
+  process.stderr.write("openhub-rc: injected Health failure\n");
+  process.exit(1);
+}
+`;
 const PROJECT_FILES = {
   "package.json": '{ "name": "rc-ops", "private": true }\n',
   ".mcp.json": PROJECT_MCP,
@@ -169,11 +184,11 @@ async function launch(ctx, extraEnv = {}) {
     main = await connect(await targetsOf(ctx.inspectPort, "node"));
     info = await main.evaluate(PATCH_DIALOG);
     page = await connect(await targetsOf(ctx.cdpPort, "page"));
-    await page.evaluate("new Promise((r) => { const f = () => (window.__openhubReady !== undefined ? r(true) : setTimeout(f, 200)); f(); })");
-    tools = await page.evaluate("Promise.resolve(window.__openhubReady)");
+    await settled(() => page.evaluate("new Promise((r) => { const f = () => (window.__openhubReady !== undefined ? r(true) : setTimeout(f, 200)); f(); })"));
+    tools = await settled(() => page.evaluate("Promise.resolve(window.__openhubReady)"));
   } catch (error) {
     // 붙지 못했으면 앱을 남기지 않는다(남으면 하네스가 끝나지 않는다).
-    child.kill();
+    killTree(child);
     main?.close();
     page?.close();
     ctx.logs.push(log.slice(-4000));
@@ -186,15 +201,43 @@ async function launch(ctx, extraEnv = {}) {
       // 이미 닫힘
     }
     const code = await Promise.race([exited, sleep(30000).then(() => "timeout")]);
-    if (code === "timeout") child.kill();
+    if (code === "timeout") killTree(child);
     main.close();
     page.close();
     ctx.logs.push(log.slice(-4000));
   };
   const answers = (list) => main.evaluate("globalThis.__rcAnswers.push(..." + JSON.stringify(list) + "), true");
   const dialogs = () => main.evaluate("globalThis.__rcDialogs.splice(0)");
-  const reloadReady = () => page.evaluate("new Promise((r) => { const f = () => (document.readyState === 'complete' && window.__openhubReady !== undefined ? r(true) : setTimeout(f, 200)); f(); })");
+  const reloadReady = () => settled(() => page.evaluate("new Promise((r) => { const f = () => (document.readyState === 'complete' && window.__openhubReady !== undefined ? r(true) : setTimeout(f, 200)); f(); })"));
   return { page, main, info, tools, quit, answers, dialogs, reloadReady };
+}
+
+/** 앱 프로세스를 끝낸다. Windows는 Electron 하위 프로세스(renderer·GPU 등)까지 트리째 끝낸다(남으면 다음 실행의 디버깅 포트를 막는다). */
+function killTree(child) {
+  if (process.platform === "win32" && child.pid !== undefined) {
+    try {
+      spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+      return;
+    } catch {
+      // taskkill이 없으면 아래로
+    }
+  }
+  child.kill();
+}
+
+/**
+ * 페이지 준비를 기다리는 evaluate만: 앱 시작 직후 첫 문서가 실제 화면으로 바뀌거나 언어 변경으로 다시 읽히는 순간에 걸리면
+ * CDP가 "Execution context was destroyed"를 돌려준다. 그 오류만 짧게 다시 시도한다(최대 20회). 다른 오류는 그대로 던진다.
+ */
+async function settled(fn) {
+  for (let i = 0; ; i += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (i >= 19 || !/Execution context was destroyed|Cannot find context with specified id|Inspected target navigated or closed/u.test(String(error))) throw error;
+      await sleep(300);
+    }
+  }
 }
 
 // ---------------------------------------------------------------- MCP stdio 세션(앱이 쓴 Client 설정 그대로)
@@ -405,18 +448,78 @@ async function run() {
     check("kubernetes-reviewed-tool-config", toolConfigs.length >= 1 && toolConfigs.every((f) => readFileSync(f, "utf8").includes('kind = "Secret"')), { files: toolConfigs.length });
     step(8, healthOk && mcpOk ? "PASS" : "FAIL", { memory: { status: memHealth.status, outcome: memHealth.outcome, lines: memHealth.lines }, kubernetes: { status: k8sHealth.status, outcome: k8sHealth.outcome, lines: k8sHealth.lines }, mcp });
 
-    // ---- 9·10 Update(고정 안 됨 → npm latest 정확한 버전) → Rollback(이전 고정 안 된 항목) → Health
+    // ---- 9·10 정확한 버전 Update(INSTALLED 목표 버전 입력): 고정 안 됨 → V1 → Health → V2 → Health → Rollback V1 → Health
+    // 실제 npm Prepare·실제 MCP Health. 단계마다 Client 설정·Version State·승인 대화상자·npm 캐시·다른 MCP 설정을 확인한다.
     progress("step 8 " + results.steps[8].status);
-    const memBefore = JSON.parse((await read(p(".mcp.json"))) ?? "{}").mcpServers?.memory;
-    const upd = await ev(app, "window.__openhubLifecycle('memory-mcp')", 1200000);
-    const memAfter = JSON.parse((await read(p(".mcp.json"))) ?? "{}").mcpServers?.memory;
-    const pinned = (memAfter?.args ?? []).find((a) => /^@modelcontextprotocol\/server-memory@\d+\.\d+\.\d+$/u.test(a)) ?? null;
-    step(9, upd.status === "updated" && pinned !== null && JSON.stringify(JSON.parse((await read(p(".mcp.json"))) ?? "{}").mcpServers?.notes) === JSON.stringify(NOTES) ? "PASS" : "FAIL", { status: upd.status, health: upd.health, before: memBefore?.args, after: memAfter?.args, exactVersion: pinned, note: "packaged app: unpinned → npm latest exact" });
-    results.notRun.push({ id: "exact-version-v1-v2-v1", step: 9, detail: "exact V1→V2→V1 needs a version choice in the app (not in this build)" });
+    const lifecycleFile = path.join(home, ".openhub", "state", "lifecycle.json");
+    const memState = async () => {
+      const doc = JSON.parse((await read(lifecycleFile)) ?? "{}");
+      const e = Object.values(doc.entries ?? {}).find((x) => x.toolId === "memory-mcp" && x.target?.scope === "project");
+      return e === undefined ? null : { requested: e.artifact?.requested ?? null, resolved: e.artifact?.resolved?.spec ?? null, previous: e.previous?.artifact?.resolved?.spec ?? e.previous?.artifact?.requested ?? null };
+    };
+    /** npx Prepare가 끝난 캐시 항목(npm이 만든 _npx/<key>/package.json의 _npx.packages와 완료 표시)이 있는가. */
+    const prepared = (spec) => {
+      const root = path.join(work, "npm-cache", "_npx");
+      if (!existsSync(root)) return false;
+      return readdirSync(root).some((k) => {
+        try {
+          const pkg = JSON.parse(readFileSync(path.join(root, k, "package.json"), "utf8"));
+          return (pkg._npx?.packages ?? []).includes(spec) && existsSync(path.join(root, k, "node_modules", ".package-lock.json"));
+        } catch {
+          return false;
+        }
+      });
+    };
+    const otherConfigs = async () => [await read(p(".codex/config.toml")), await read(path.join(home, ".cursor", "mcp.json")), await read(path.join(home, ".codex", "config.toml"))];
+    const others0 = await otherConfigs();
+    await app.dialogs();
+    const exactStep = async (version) => {
+      const spec = MEMORY_PKG + "@" + version;
+      const r = await ev(app, "window.__openhubLifecycleUpdateTo('memory-mcp', " + JSON.stringify(version) + ")", 1200000);
+      const detail = String((await app.dialogs()).at(-1)?.detail ?? "");
+      const doc = JSON.parse((await read(p(".mcp.json"))) ?? "{}");
+      const health = await ev(app, "window.__openhubLifecycleRun('memory-mcp', 'health')", 600000);
+      await app.dialogs();
+      const out = {
+        version,
+        status: r.status,
+        outcome: r.outcome,
+        plan: r.plan ? { from: r.plan.from, to: r.plan.to } : null,
+        requirements: r.requirements ?? [],
+        clientArgs: doc.mcpServers?.memory?.args ?? null,
+        notesKept: JSON.stringify(doc.mcpServers?.notes) === JSON.stringify(NOTES),
+        state: await memState(),
+        prepared: prepared(spec),
+        dialog: { versionLine: r.plan ? detail.includes(r.plan.from + " → " + spec) : false, prepareCommand: detail.includes("--package=" + spec), approvalIds: [...detail.matchAll(/\[([a-z][a-z-]+)\]/gu)].map((m) => m[1]) },
+        health: { status: health.status, outcome: health.outcome },
+      };
+      out.ok =
+        out.status === "updated" && out.outcome === "succeeded" && out.plan?.to === spec && (out.clientArgs ?? []).includes(spec) && out.notesKept && out.state?.resolved === spec && out.prepared &&
+        out.dialog.versionLine && out.dialog.prepareCommand && out.dialog.approvalIds.includes("health-execution") && out.health.status === "health-checked" && out.health.outcome === "succeeded";
+      return out;
+    };
+    const v1 = await exactStep(MEMORY_V1);
+    const memV1 = JSON.parse((await read(p(".mcp.json"))) ?? "{}").mcpServers?.memory;
+    const v2 = await exactStep(MEMORY_V2);
+    const othersKept9 = JSON.stringify(await otherConfigs()) === JSON.stringify(others0);
+    step(9, v1.ok && v2.ok && v2.plan?.from === MEMORY_PKG + "@" + MEMORY_V1 && v2.state?.previous === MEMORY_PKG + "@" + MEMORY_V1 && othersKept9 ? "PASS" : "FAIL", { v1, v2, otherConfigsKept: othersKept9 });
     const rb = await ev(app, "window.__openhubLifecycleRun('memory-mcp', 'rollback')", 1200000);
+    const rbDetail = String((await app.dialogs()).at(-1)?.detail ?? "");
     const memRolled = JSON.parse((await read(p(".mcp.json"))) ?? "{}").mcpServers?.memory;
+    const rbState = await memState();
     const rbHealth = await ev(app, "window.__openhubLifecycleRun('memory-mcp', 'health')", 600000);
-    step(10, rb.status === "rolled-back" && JSON.stringify(memRolled) === JSON.stringify(memBefore) && rbHealth.outcome === "succeeded" ? "PASS" : "FAIL", { status: rb.status, outcome: rb.outcome, lines: rb.lines, restoredToPrevious: JSON.stringify(memRolled) === JSON.stringify(memBefore), healthAfter: rbHealth.outcome });
+    await app.dialogs();
+    const othersKept10 = JSON.stringify(await otherConfigs()) === JSON.stringify(others0);
+    const rollback = {
+      status: rb.status,
+      outcome: rb.outcome,
+      clientEntryEqualsV1: JSON.stringify(memRolled) === JSON.stringify(memV1),
+      state: rbState,
+      dialogVersionLine: rbDetail.includes(MEMORY_PKG + "@" + MEMORY_V2 + " → " + MEMORY_PKG + "@" + MEMORY_V1),
+      healthAfter: { status: rbHealth.status, outcome: rbHealth.outcome },
+      otherConfigsKept: othersKept10,
+    };
+    step(10, rb.status === "rolled-back" && rb.outcome === "succeeded" && rollback.clientEntryEqualsV1 && rbState?.resolved === MEMORY_PKG + "@" + MEMORY_V1 && rollback.dialogVersionLine && rbHealth.status === "health-checked" && rbHealth.outcome === "succeeded" && othersKept10 ? "PASS" : "FAIL", rollback);
     // Kubernetes는 검토된 0.0.67만: update는 바꿀 것이 없다.
     const k8sUpd = await ev(app, "window.__openhubLifecycle('kubernetes-mcp-server')", 600000);
     check("kubernetes-only-0.0.67", ["up-to-date", "not-updatable", "not-executable"].includes(k8sUpd.status) && codexToml.includes("kubernetes-mcp-server@0.0.67"), { update: k8sUpd.status });
@@ -433,7 +536,6 @@ async function run() {
     }
     // 사용자 범위를 숨긴 동안 사용자 항목은 not-inspected(읽지 않음)가 정상이다.
     step(11, repair !== null && repair.status === "repaired" && repair.outcome === "succeeded" && repair.restored && repair.after.includes("state-consistent") && repair.after.every((s) => s === "state-consistent" || s === "not-inspected") ? "PASS" : "FAIL", repair);
-    results.notRun.push({ id: "health-failure-compensation", step: 11, detail: "needs a failing real MCP server in the packaged app; covered only by automated tests" });
 
     // ---- 12 English / Korean, 승인 대화상자 언어
     progress("step 11 " + results.steps[11].status);
@@ -468,6 +570,38 @@ async function run() {
     await app.quit();
     app = undefined;
 
+    // ---- Health 실패 보상(단계 9·10의 Update 경로, 단계 13 다음에 별도 실행): 앱을 합성 실패 주입 환경으로 띄워 V2로 Update →
+    // 실제 Prepare·설정 교체 → 실제 Health 실패 → Client 설정·Version State가 Update 전 byte로 돌아오는지 본다. 끝나면 앱을 닫는다.
+    progress("step 13 " + results.steps[13].status + "; launch with injected Health failure");
+    const injector = path.join(work, "rc-health-fail.cjs");
+    const injectMark = path.join(work, "rc-health-fail.log");
+    await writeFile(injector, HEALTH_FAIL_INJECTOR);
+    await rm(injectMark, { force: true });
+    app = await launch(ctx, { npm_config_node_options: "--require=" + JSON.stringify(injector), OPENHUB_RC_INJECT_MARK: injectMark });
+    await ev(app, "window.__openhubScanProject()");
+    const beforeFail = [await read(p(".mcp.json")), await read(lifecycleFile), ...(await otherConfigs())];
+    const failed = await ev(app, "window.__openhubLifecycleUpdateTo('memory-mcp', " + JSON.stringify(MEMORY_V2) + ")", 1200000);
+    const afterFail = [await read(p(".mcp.json")), await read(lifecycleFile), ...(await otherConfigs())];
+    const injected = ((await read(injectMark)) ?? "").split("\n").filter(Boolean).length;
+    await app.quit();
+    app = undefined;
+    const compensation = {
+      status: failed.status,
+      outcome: failed.outcome,
+      plan: failed.plan ? { from: failed.plan.from, to: failed.plan.to } : null,
+      injectedLaunchesKilled: injected,
+      clientConfigRestored: afterFail[0] === beforeFail[0],
+      versionStateUnchanged: afterFail[1] === beforeFail[1],
+      otherConfigsKept: JSON.stringify(afterFail.slice(2)) === JSON.stringify(beforeFail.slice(2)),
+      stateAfter: await memState(),
+      lines: (failed.lines ?? []).filter((l) => /health|Health|revert|되돌/u.test(l)).slice(0, 6),
+    };
+    check(
+      "health-failure-compensation",
+      failed.status === "health-failed" && failed.outcome === "failed" && injected >= 1 && compensation.clientConfigRestored && compensation.versionStateUnchanged && compensation.otherConfigsKept && compensation.stateAfter?.resolved === MEMORY_PKG + "@" + MEMORY_V1,
+      compensation,
+    );
+
     // ---- 4(빈 프로젝트 진단)
     progress("step 13 " + results.steps[13].status + "; launch 3 (empty project)");
     app = await launch(ctx, { OPENHUB_SMOKE_PROJECT: empty });
@@ -490,7 +624,7 @@ async function run() {
     results.errors.push(String(error instanceof Error ? error.stack ?? error.message : error));
   } finally {
     if (app) await app.quit();
-    for (const c of ctx.children) if (c.exitCode === null && c.signalCode === null) c.kill();
+    for (const c of ctx.children) if (c.exitCode === null && c.signalCode === null) killTree(c);
     api.close();
     results.finishedAt = new Date().toISOString();
     results.appLogTail = ctx.logs.map((l) => l.replace(new RegExp(TOKEN, "gu"), "<token>"));
@@ -518,6 +652,8 @@ async function run() {
 /** CI에서 실패 전파를 확인하기 위한 주입. 값이 없거나 none이면 아무것도 바꾸지 않는다. */
 function injectFailure(results, kind) {
   if (kind === undefined || kind === "" || kind === "none") return;
+  // uninstall-exit은 workflow 단계 15(Windows 제거)가 처리한다. 단계 3~14 결과는 바꾸지 않는다.
+  if (kind === "uninstall-exit") return;
   results.injected = kind;
   if (kind === "step-fail") results.steps[14] = { status: "FAIL", evidence: "injected" };
   else if (kind === "check-fail") results.checks["injected"] = { status: "FAIL", evidence: "injected" };
