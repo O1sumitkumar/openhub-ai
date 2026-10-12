@@ -11,6 +11,7 @@ import type { RecommendPlatform } from "../recommendation/index";
 import type { RegistryEntry } from "../registry/index";
 import { entryKeyOf, type ArtifactIdentity, type LastHealth, type ToolState } from "./state";
 import { commitLifecycleState, projectKeyFor, readLifecycleState, type StateErrorCode } from "./store";
+import { readJournals } from "./journal";
 import { inspectRecordedLauncher, inspectToolConfig, planFormOfEntry, toolConfigLocation, type LauncherCheckFs, type ToolConfigFs } from "../tool-config/index";
 
 /**
@@ -33,6 +34,7 @@ import { inspectRecordedLauncher, inspectToolConfig, planFormOfEntry, toolConfig
  */
 export const LIFECYCLE_ENTRY_STATES = [
   "state-consistent",
+  "interrupted-update",
   "config-drift",
   "missing-config",
   "tool-config-missing",
@@ -199,7 +201,8 @@ export interface LifecycleStatusOptions {
   launcherCheckFs?: LauncherCheckFs;
 }
 
-export type LifecycleStatusResult = { ok: true; items: LifecycleToolStatus[] } | { ok: false; code: StateErrorCode; message: string };
+/** journalsUnreadable(v0.2.1): 읽을 수 없는(손상된) 작업 기록 수. 0보다 크면 모든 lifecycle 작업이 JOURNAL_DAMAGED로 막힌다. */
+export type LifecycleStatusResult = { ok: true; items: LifecycleToolStatus[]; journalsUnreadable: number } | { ok: false; code: StateErrorCode; message: string };
 
 const order = (a: LifecycleToolStatus, b: LifecycleToolStatus) =>
   (a.scope === b.scope ? 0 : a.scope === "project" ? -1 : 1) || (a.serverName < b.serverName ? -1 : a.serverName > b.serverName ? 1 : 0) || (a.client < b.client ? -1 : a.client > b.client ? 1 : 0);
@@ -213,6 +216,9 @@ export async function lifecycleStatus(options: LifecycleStatusOptions): Promise<
   const roots = { projectRoot: options.projectRoot, homeDir: options.homeDir, fs };
   const items: LifecycleToolStatus[] = [];
   const tracked = new Set<string>();
+  // (v0.2.1 P0-3) 중간에 끝난 작업의 대상(Journal). OpenHub 자신의 기록이라 사용자 범위를 검사하지 않아도 알 수 있다.
+  const journals = await readJournals(options.homeDir);
+  const interrupted = new Set(journals.ok ? journals.journals.flatMap((j) => j.targets.map((t) => t.entryKey)) : []);
 
   for (const state of Object.values(read.state.entries)) {
     const t = state.target;
@@ -244,6 +250,10 @@ export async function lifecycleStatus(options: LifecycleStatusOptions): Promise<
         }
       }
       entryState = issues[0] ?? "state-consistent";
+    }
+    if (interrupted.has(entryKeyOf(t))) {
+      issues.unshift("interrupted-update");
+      entryState = "interrupted-update";
     }
     items.push({
       toolId: state.toolId,
@@ -298,5 +308,5 @@ export async function lifecycleStatus(options: LifecycleStatusOptions): Promise<
       });
     }
   }
-  return { ok: true, items: items.sort(order) };
+  return { ok: true, items: items.sort(order), journalsUnreadable: journals.ok ? journals.unreadable : 0 };
 }
